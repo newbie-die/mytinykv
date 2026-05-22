@@ -1,3 +1,5 @@
+//peer_msg_handler.go handles messages received by peer, including raft messages, raft commands, ticks, etc.
+
 package raftstore
 
 import (
@@ -6,18 +8,18 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	eraftpb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
-	 "github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-    "github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
-    eraftpb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 type PeerTick int
@@ -57,8 +59,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		panic(err)
 	}
 	if applySnapResult != nil {
-		// 2C snapshot handling, skip for 2B
-		_ = applySnapResult
+		// 更新 storeMeta 中的 region 信息
+		prevRegion := applySnapResult.PrevRegion
+		newRegion := applySnapResult.Region
+
+		meta := d.ctx.storeMeta
+		meta.Lock()
+		// 删除旧 region 的 range 记录
+		if d.isInitialized() {
+			meta.regionRanges.Delete(&regionItem{region: prevRegion})
+		}
+		meta.regions[newRegion.Id] = newRegion
+		meta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+		meta.Unlock()
+
+		d.peerStorage.SetRegion(newRegion)
 	}
 
 	// Send messages
@@ -406,9 +421,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

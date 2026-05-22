@@ -235,25 +235,29 @@ func (rn *RawNode) HasReady() bool {
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
+
 func (rn *RawNode) Advance(rd Ready) {
-	if len(rd.Entries) > 0 {
-		lastStabled := rd.Entries[len(rd.Entries)-1].Index
-		if lastStabled > rn.Raft.RaftLog.stabled {
-			rn.Raft.RaftLog.stabled = lastStabled
-		}
-	}
-	if len(rd.CommittedEntries) > 0 {
-		lastApplied := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		if lastApplied > rn.Raft.RaftLog.applied {
-			rn.Raft.RaftLog.applied = lastApplied
-		}
-	}
-	if !IsEmptyHardState(rd.HardState) {
-		rn.prevHardSt = rd.HardState
-	}
-	if rd.SoftState != nil {
-		rn.prevSoftSt = rd.SoftState
-	}
+    if len(rd.Entries) > 0 {
+        lastStabled := rd.Entries[len(rd.Entries)-1].Index
+        if lastStabled > rn.Raft.RaftLog.stabled {
+            rn.Raft.RaftLog.stabled = lastStabled
+        }
+    }
+    if len(rd.CommittedEntries) > 0 {
+        lastApplied := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+        if lastApplied > rn.Raft.RaftLog.applied {
+            rn.Raft.RaftLog.applied = lastApplied
+        }
+    }
+    if !IsEmptyHardState(rd.HardState) {
+        rn.prevHardSt = rd.HardState
+    }
+    if rd.SoftState != nil {
+        rn.prevSoftSt = rd.SoftState
+    }
+    
+    // ✅ 添加 maybeCompact 调用
+    rn.Raft.RaftLog.maybeCompact()
 }
 
 // GetProgress return the Progress of this node and its peers, if this

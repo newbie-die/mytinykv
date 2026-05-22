@@ -1,3 +1,5 @@
+//raft.go implements the core Raft algorithm. The API is defined in rawnode.go, and raft.go provides the implementation of the Raft struct and its methods.
+
 // Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +18,11 @@ package raft
 
 import (
 	"errors"
+	//"fmt"
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log" // ✅ 添加这一行
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -241,31 +245,30 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := pr.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
-		// 无法获取 prevLogTerm，需要发送 snapshot（2C 实现）
+		// prevLogTerm 不可达，说明已被 compact，改发 Snapshot
+		r.sendSnapshot(to)
 		return false
 	}
 
-	// 收集 [pr.Next, lastIndex] 之间的 entries
 	var entries []*pb.Entry
-
 	lastIndex := r.RaftLog.LastIndex()
 	if pr.Next <= lastIndex {
 		var ents []pb.Entry
+		var fetchErr error
 		if len(r.RaftLog.entries) > 0 {
 			firstInMem := r.RaftLog.entries[0].Index
 			if pr.Next >= firstInMem {
 				ents = r.RaftLog.entries[pr.Next-firstInMem:]
 			} else {
-				ents, err = r.RaftLog.storage.Entries(pr.Next, lastIndex+1)
-				if err != nil {
-					return false
-				}
+				ents, fetchErr = r.RaftLog.storage.Entries(pr.Next, lastIndex+1)
 			}
 		} else {
-			ents, err = r.RaftLog.storage.Entries(pr.Next, lastIndex+1)
-			if err != nil {
-				return false
-			}
+			ents, fetchErr = r.RaftLog.storage.Entries(pr.Next, lastIndex+1)
+		}
+		if fetchErr != nil {
+			// 同样改发 Snapshot
+			r.sendSnapshot(to)
+			return false
 		}
 		for i := range ents {
 			entries = append(entries, &ents[i])
@@ -283,6 +286,24 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Commit:  r.RaftLog.committed,
 	})
 	return true
+}
+
+// sendSnapshot 向 to 发送 Snapshot 消息
+func (r *Raft) sendSnapshot(to uint64) {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		// Snapshot 还没生成好，本次放弃，下次 tick 再触发
+		return
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	})
+	// 更新 Next，避免重复发
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -541,6 +562,9 @@ func (r *Raft) Step(m pb.Message) error {
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+
 	}
 	return nil
 }
@@ -667,7 +691,74 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+    snap := m.Snapshot
+    if snap == nil {
+        log.Infof("[DEBUG] Snapshot is nil")
+        return
+    }
+    snapMeta := snap.Metadata
+    
+    log.Infof("[DEBUG] Before check: snapMeta.Index=%d, committed=%d", 
+        snapMeta.Index, r.RaftLog.committed)
+
+    // 如果 snapshot 比自己已 committed 的还旧，忽略
+    if snapMeta.Index <= r.RaftLog.committed {
+        log.Infof("[DEBUG] REJECTED: snapshot is stale")
+        r.msgs = append(r.msgs, pb.Message{
+            MsgType: pb.MessageType_MsgAppendResponse,
+            From:    r.id,
+            To:      m.From,
+            Term:    r.Term,
+            Index:   r.RaftLog.committed,
+        })
+        return
+    }
+
+    log.Infof("[DEBUG] APPLYING snapshot")
+    r.becomeFollower(m.Term, m.From)
+
+    // 用一条哑 entry 作为占位
+    r.RaftLog.entries = []pb.Entry{{
+        Index: snapMeta.Index,
+        Term:  snapMeta.Term,
+    }}
+    
+    log.Infof("[DEBUG] After setting entries: len=%d, entries[0].Index=%d", 
+        len(r.RaftLog.entries), r.RaftLog.entries[0].Index)
+
+    r.RaftLog.committed  = snapMeta.Index
+    r.RaftLog.applied    = snapMeta.Index
+    r.RaftLog.stabled    = snapMeta.Index
+    r.RaftLog.pendingSnapshot = snap
+
+    // ✅ 添加防御性检查
+    if snapMeta.ConfState == nil {
+        log.Errorf("[DEBUG] ERROR: snapMeta.ConfState is nil!")
+        return
+    }
+    
+    log.Infof("[DEBUG] ConfState.Nodes = %v", snapMeta.ConfState.Nodes)
+
+    // 重建 Prs（成员列表）
+    r.Prs = make(map[uint64]*Progress)
+    for _, id := range snapMeta.ConfState.Nodes {
+        r.Prs[id] = &Progress{
+            Match: 0,
+            Next:  snapMeta.Index + 1,
+        }
+    }
+    
+    log.Infof("[DEBUG] After rebuilding Prs: len=%d, keys=%v", 
+        len(r.Prs), nodes(r))
+
+    // 回复 AppendResponse
+    r.msgs = append(r.msgs, pb.Message{
+        MsgType: pb.MessageType_MsgAppendResponse,
+        From:    r.id,
+        To:      m.From,
+        Term:    r.Term,
+        Index:   snapMeta.Index,
+    })
 }
 
 // addNode add a new node to raft group

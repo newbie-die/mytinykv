@@ -1,3 +1,5 @@
+//peer_storage.go implements the PeerStorage struct, which is responsible for managing the persistent state of a Raft peer, including the Raft log entries, Raft state, and apply state. It provides methods to retrieve log entries, terms, and snapshots, as well as to save the ready state and apply snapshots. The PeerStorage interacts with the underlying storage engines (Badger) to persist and retrieve data.
+
 package raftstore
 
 import (
@@ -50,8 +52,7 @@ type PeerStorage struct {
 	Tag string
 }
 
-
-//新增辅助函数，用于打印日志
+// 新增辅助函数，用于打印日志
 func dbgPSRangeEntries(ents []eraftpb.Entry) (uint64, uint64, int) {
 	if len(ents) == 0 {
 		return 0, 0, 0
@@ -319,14 +320,14 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	//------------------------打印日志------------------------------------------------
-	eFirst, eLast, eN := dbgPSRangeEntries(entries)
-	log.Infof("[DBG-PERSIST] region=%d Append begin entries=[%d,%d] n=%d oldLastIndex=%d oldLastTerm=%d",
-		ps.region.Id, eFirst, eLast, eN, ps.raftState.LastIndex, ps.raftState.LastTerm)
+	// eFirst, eLast, eN := dbgPSRangeEntries(entries)
+	// log.Infof("[DBG-PERSIST] region=%d Append begin entries=[%d,%d] n=%d oldLastIndex=%d oldLastTerm=%d",
+	// 	ps.region.Id, eFirst, eLast, eN, ps.raftState.LastIndex, ps.raftState.LastTerm)
 	//---------------------------------------------------------------------------------
 
 	if len(entries) == 0 {
 		//---------------------------------------打印日志---------------------------------
-		log.Infof("[DBG-PERSIST] region=%d Append skip empty entries", ps.region.Id)
+		// log.Infof("[DBG-PERSIST] region=%d Append skip empty entries", ps.region.Id)
 		//---------------------------------------------------------------------------------
 		return nil
 	}
@@ -341,27 +342,26 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
 		//----------------打印日志---------------------------------------------------------------
 		// if entry.Index == eFirst || entry.Index == eLast {
-    	// 	log.Infof(
-        // 		"[DBG-PERSIST] Append WRITE ENTRY region=%d index=%d term=%d",
-        // 		ps.region.GetId(),
-        // 		entry.Index,
-        // 		entry.Term,
-    	// 	)
+		// 	log.Infof(
+		// 		"[DBG-PERSIST] Append WRITE ENTRY region=%d index=%d term=%d",
+		// 		ps.region.GetId(),
+		// 		entry.Index,
+		// 		entry.Term,
+		// 	)
 		// }
 		//-----------------------------------------------------------------------------------
 	}
 	//----------------------打印日志----------------------------------------------------------
-	log.Infof("[DBG-PERSIST] region=%d Append wrote entries=[%d,%d] n=%d",
-		ps.region.Id, eFirst, eLast, eN)
+	// log.Infof("[DBG-PERSIST] region=%d Append wrote entries=[%d,%d] n=%d",
+	// 	ps.region.Id, eFirst, eLast, eN)
 	//----------------------------------------------------------------------------------------
-
 
 	// Delete overwritten old log entries
 	//--------------------打印日志--------------------------------------------------------------
-	if lastNewIndex+1 <= oldLastIndex {
-		log.Infof("[DBG-PERSIST] region=%d Append delete overwritten range=[%d,%d]",
-			ps.region.Id, lastNewIndex+1, oldLastIndex)
-	}
+	// if lastNewIndex+1 <= oldLastIndex {
+	// 	log.Infof("[DBG-PERSIST] region=%d Append delete overwritten range=[%d,%d]",
+	// 		ps.region.Id, lastNewIndex+1, oldLastIndex)
+	// }
 	//-----------------------------------------------------------------------------------------------
 	for i := lastNewIndex + 1; i <= oldLastIndex; i++ {
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
@@ -372,7 +372,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	ps.raftState.LastTerm = lastNewTerm
 	//-----------------------打印日志---------------------------------------------------------
 	log.Infof("[DBG-PERSIST] region=%d Append end newLastIndex=%d newLastTerm=%d",
-	ps.region.Id, ps.raftState.LastIndex, ps.raftState.LastTerm)
+		ps.region.Id, ps.raftState.LastIndex, ps.raftState.LastTerm)
 	//------------------------------------------------------------------------------------------
 
 	return nil
@@ -381,82 +381,118 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-//--------------------打印日志-------------------------------------------------------------
-eFirst, eLast, eN := dbgPSRangeEntries(ready.Entries)
-cFirst, cLast, cN := dbgPSRangeEntries(ready.CommittedEntries)
-log.Infof("[DBG-PERSIST] region=%d SaveReadyState begin entries=[%d,%d] n=%d committed=[%d,%d] n=%d persistedLastIndex(before)=%d persistedLastTerm(before)=%d hardStateEmpty=%v",
-	ps.region.Id,
-	eFirst, eLast, eN,
-	cFirst, cLast, cN,
-	ps.raftState.LastIndex,
-	ps.raftState.LastTerm,
-	raft.IsEmptyHardState(ready.HardState),
-)
-if cN > 0 && cLast > ps.raftState.LastIndex && eN == 0 {
-	log.Warnf("[DBG-ASSERT] region=%d SaveReadyState committedLast(%d) > persistedLastIndex(%d) while ready.Entries empty",
-		ps.region.Id, cLast, ps.raftState.LastIndex)
-}
-//----------------------------------------------------------------------------------------
-
 	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
 
-	// Persist entries
-	//---------------------------------------------------------------------------------
-	// if err := ps.Append(ready.Entries, raftWB); err != nil {
-	// 	return nil, err
-	// }
-	//------------------替换为--------------------------------------------------------
-	oldLastIndex := ps.raftState.LastIndex
-if err := ps.Append(ready.Entries, raftWB); err != nil {
-	log.Errorf("[DBG-PERSIST] region=%d SaveReadyState Append err=%v", ps.region.Id, err)
-	return nil, err
-}
-log.Infof("[DBG-PERSIST] region=%d SaveReadyState after Append lastIndex %d -> %d",
-	ps.region.Id, oldLastIndex, ps.raftState.LastIndex)
-	//-----------------------------------------------------------------------------------------
+	var applySnapResult *ApplySnapResult
 
-	// Update HardState if not empty
+	// 1. 如果有 Snapshot，先 apply
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		result, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+		applySnapResult = result
+		// ApplySnapshot 内部已写 kvWB / raftWB，先落盘
+		if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+			return nil, err
+		}
+		if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+			return nil, err
+		}
+		// 重置 WriteBatch
+		kvWB = new(engine_util.WriteBatch)
+		raftWB = new(engine_util.WriteBatch)
+	}
+
+	// 2. 持久化 entries
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+
+	// 3. 持久化 HardState
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
-
-	// Persist raftState
-	//------------------------打印日志-----------------------------------------------
-	log.Infof(
-    	"[DBG-PERSIST] SetMeta raftState region=%d "+
-        	"LastIndex=%d LastTerm=%d "+
-        	"HardState={term=%d vote=%d commit=%d}",
-    	ps.region.GetId(),
-    	ps.raftState.LastIndex,
-    	ps.raftState.LastTerm,
-    	ps.raftState.HardState.Term,
-    	ps.raftState.HardState.Vote,
-    	ps.raftState.HardState.Commit,
-	)
-	//------------------------------------------------------------------------------
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 
-	// Write to raft DB
+	// 4. 落盘
 	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 		return nil, err
 	}
 
-	return nil, nil
+	return applySnapResult, nil
 }
 
 // Apply the peer with given snapshot
-func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
+func (ps *PeerStorage) ApplySnapshot(
+	snapshot *eraftpb.Snapshot,
+	kvWB *engine_util.WriteBatch,
+	raftWB *engine_util.WriteBatch,
+) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
+
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	// 先保存 prev region 用于返回
+	prevRegion := ps.region
+
+	// 清除旧 meta（只有 peer 已初始化时才有旧数据需要清）
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// 用 snapshot metadata 更新 raftState
+	snapMeta := snapshot.Metadata
+	ps.raftState.LastIndex = snapMeta.Index
+	ps.raftState.LastTerm = snapMeta.Term
+
+	// 用 snapshot metadata 更新 applyState
+	ps.applyState.AppliedIndex = snapMeta.Index
+	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
+		Index: snapMeta.Index,
+		Term:  snapMeta.Term,
+	}
+
+	// 更新 region
+	ps.region = snapData.Region
+
+	// 持久化 regionLocalState（标记为 Normal）
+	regionState := &rspb.RegionLocalState{
+		State:  rspb.PeerState_Normal,
+		Region: snapData.Region,
+	}
+	kvWB.SetMeta(meta.RegionStateKey(snapData.Region.Id), regionState)
+
+	// 持久化 applyState 和 raftState
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState)
+	raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState)
+
+	// 异步（这里同步等待）安装 snapshot 数据到 kvDB
+	ch := make(chan bool, 1)
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		Notifier: ch,
+		SnapMeta: snapMeta,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	// 等待安装完成
+	<-ch
+
+	return &ApplySnapResult{
+		PrevRegion: prevRegion,
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.
